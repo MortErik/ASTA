@@ -64,10 +64,10 @@ namespace Rigsarkiv.Styx
             var message = string.Format("Start Converting Data {0} -> {1}", _srcFolder, _destFolder);
             _log.Info(message);
             _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = message });
-           if(EnsureMissingValues() && EnsureCodeLists() && EnsureTables())
+            if (EnsureMissingValues() && EnsureCodeLists() && EnsureTables())
             {
                 result = true;
-                if (_report.ScriptType == ScriptType.SPSS) { result = EnsureUserCodes(); }                
+                if (_report.ScriptType == ScriptType.SPSS) { result = EnsureUserCodes(); }
             }
             message = result ? "End Converting Data" : "End Converting Data with errors";
             _log.Info(message);
@@ -102,33 +102,80 @@ namespace Rigsarkiv.Styx
         {
             var result = true;
             string path = null;
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = "Starting table processing for all tables"
+            });
+
             try
             {
-                 _report.Tables.ForEach(table =>
+                _report.Tables.ForEach(table =>
                 {
                     table.RowsCounter = 0;
                     XNamespace tableNS = string.Format(TableXmlNs, table.SrcFolder);
                     path = string.Format(TableDataPath, _destFolderPath, _report.ScriptType.ToString().ToLower(), NormalizeName(table.Name));
-                    _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Add file: {0}", path) });
+
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Processing table '{table.Name}' to path: {path}"
+                    });
+
                     using (TextWriter sw = new StreamWriter(path))
                     {
-                        _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Write {0} data header", table.Folder) });
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Writing header for table '{table.Folder}' with {table.Columns.Count} columns"
+                        });
+
                         sw.WriteLine(string.Join(Separator, table.Columns.Select(c => NormalizeName(c.Name)).ToArray()));
                         path = string.Format(TablePath, _srcPath, table.SrcFolder);
+
                         StreamElement(delegate (XElement row) {
                             table.RowsCounter++;
                             sw.WriteLine(GetRow(table, row, tableNS));
-                            if ((table.RowsCounter % RowsChunk) == 0) { _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("{0} of {1} rows added", table.RowsCounter, table.Rows) }); }
-                        }, path);                        
+                            if ((table.RowsCounter % RowsChunk) == 0)
+                            {
+                                _logManager.Add(new LogEntity()
+                                {
+                                    Level = LogLevel.Info,
+                                    Section = _logSection,
+                                    Message = $"Table '{table.Name}': Processed {table.RowsCounter:N0} of {table.Rows:N0} rows ({(double)table.RowsCounter / table.Rows:P1} complete)"
+                                });
+                            }
+                        }, path);
                     }
                     _report.TablesCounter++;
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Completed processing table '{table.Name}'. Total rows: {table.RowsCounter:N0}"
+                    });
+                });
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Successfully processed all {_report.TablesCounter} tables"
                 });
             }
             catch (Exception ex)
             {
                 result = false;
-                _log.Error("EnsureTables Failed", ex);
-                _logManager.Add(new LogEntity() { Level = LogLevel.Error, Section = _logSection, Message = string.Format("EnsureTables Failed: {0}", ex.Message) });
+                _log.Error($"Failed processing tables at path: {path}", ex);
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Table processing failed: {ex.Message}. Stack trace: {ex.StackTrace}"
+                });
             }
             return result;
         }
@@ -147,11 +194,11 @@ namespace Rigsarkiv.Styx
                     content = GetConvertedValue(column, content, out hasError, out isDifferent, table.RowsCounter);
                 }
                 contents.Add(content);
-            });            
+            });
             return string.Join(Separator, contents.ToArray());
         }
 
-        private void UpdateRange(Column column,string value)
+        private void UpdateRange(Column column, string value)
         {
             if (string.IsNullOrEmpty(column.Highest)) { column.Highest = "0"; }
             if (string.IsNullOrEmpty(column.Lowest)) { column.Lowest = "0"; }
@@ -165,7 +212,7 @@ namespace Rigsarkiv.Styx
                     if (current > tmp) { column.Highest = current.ToString(); }
                     tmp = int.Parse(column.Lowest);
                     if (current < tmp) { column.Lowest = current.ToString(); }
-                }                
+                }
             }
             if (column.TypeOriginal == "DECIMAL")
             {
@@ -183,178 +230,541 @@ namespace Rigsarkiv.Styx
 
         private void EnsureTableMissingValues(Table table, XNamespace tableNS)
         {
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting missing values analysis for table: {table.Name}"
+            });
+
             var counter = 0;
-            _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Ensure Missing Values for table: {0}", table.Name) });
+            var columnsWithMissing = table.Columns.Where(c => c.MissingValues != null).ToList();
+
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Found {columnsWithMissing.Count} columns with missing values to process"
+            });
+
             var path = string.Format(TablePath, _srcPath, table.SrcFolder);
-            StreamElement(delegate (XElement row) {
-                table.Columns.Where(c => c.MissingValues != null).ToList().ForEach(column => {
-                    var content = row.Element(tableNS + column.Id).Value;
-                    if (!string.IsNullOrEmpty(content))
+
+            try
+            {
+                StreamElement(delegate (XElement row) {
+                    columnsWithMissing.ForEach(column => {
+                        var content = row.Element(tableNS + column.Id).Value;
+                        if (!string.IsNullOrEmpty(content))
+                        {
+                            UpdateRange(column, content);
+                        }
+                    });
+                    counter++;
+                    if ((counter % RowsChunk) == 0)
                     {
-                        UpdateRange(column, content);
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Processed {counter:N0} of {table.Rows:N0} rows ({(double)counter / table.Rows:P1} complete)"
+                        });
                     }
+                }, path);
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Completed missing values analysis for table {table.Name}"
                 });
-                counter++;
-                if ((counter % RowsChunk) == 0) { _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("{0} of {1} rows checked", counter, table.Rows) }); }
-            }, path);
+            }
+            catch (Exception ex)
+            {
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Error analyzing missing values for table {table.Name}: {ex.Message}"
+                });
+                throw;
+            }
         }
 
         private void EnsureCodeListMissingValues(Table table)
         {
-            string path = null;
-            table.Columns.Where(c => c.CodeList != null && c.MissingValues != null).ToList().ForEach(column =>
+            _logManager.Add(new LogEntity()
             {
-                _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Ensure Missing Values for codelist: {0}", column.CodeList.Name) });
-                XNamespace tableNS = string.Format(TableXmlNs, column.CodeList.SrcFolder);
-                path = string.Format(TablePath, _srcPath, column.CodeList.SrcFolder);
-                var columnId = column.CodeList.Columns.Where(c => c.IsKey).Select(c => c.Id).FirstOrDefault();
-                StreamElement(delegate (XElement row) {
-                    var content = row.Element(tableNS + columnId).Value;
-                    UpdateRange(column, content);
-                }, path);
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting code list missing values analysis for table: {table.Name}"
             });
+
+            string path = null;
+            var columnsWithCodeList = table.Columns.Where(c => c.CodeList != null && c.MissingValues != null).ToList();
+
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Found {columnsWithCodeList.Count} columns with code lists and missing values"
+            });
+
+            try
+            {
+                columnsWithCodeList.ForEach(column =>
+                {
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Processing missing values for code list: {column.CodeList.Name}"
+                    });
+
+                    XNamespace tableNS = string.Format(TableXmlNs, column.CodeList.SrcFolder);
+                    path = string.Format(TablePath, _srcPath, column.CodeList.SrcFolder);
+                    var columnId = column.CodeList.Columns.Where(c => c.IsKey).Select(c => c.Id).FirstOrDefault();
+
+                    var processedRows = 0;
+                    StreamElement(delegate (XElement row) {
+                        var content = row.Element(tableNS + columnId).Value;
+                        UpdateRange(column, content);
+                        processedRows++;
+
+                        if (processedRows % 1000 == 0)
+                        {
+                            _logManager.Add(new LogEntity()
+                            {
+                                Level = LogLevel.Debug,
+                                Section = _logSection,
+                                Message = $"Processed {processedRows} rows for code list {column.CodeList.Name}"
+                            });
+                        }
+                    }, path);
+
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Completed missing values analysis for code list {column.CodeList.Name}"
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Error analyzing code list missing values at path {path}: {ex.Message}"
+                });
+                throw;
+            }
         }
+
 
         private void ConvertMissingValuesToIntegers(Regex regex, Column column, int length, List<string> availableNumerics)
         {
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting integer conversion for column {column.Name} with length {length}"
+            });
+
             if (length > 0)
             {
-                if (length > 9) { length = 9; }
+                if (length > 9)
+                {
+                    length = 9;
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Warning,
+                        Section = _logSection,
+                        Message = $"Length truncated to 9 for column {column.Name}"
+                    });
+                }
+
                 int newValue = ((int.Parse(Math.Pow(10, length).ToString()) - 1) * -1);
-                column.MissingValues.Where(v => regex.IsMatch(v.Key)).ToList().ForEach(value =>
+                var matchingValues = column.MissingValues.Where(v => regex.IsMatch(v.Key)).ToList();
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Found {matchingValues.Count} values to convert for column {column.Name}"
+                });
+
+                matchingValues.ForEach(value =>
                 {
                     while (int.Parse(column.Lowest) > newValue && availableNumerics.Contains(newValue.ToString()))
                     {
                         newValue++;
                     }
+
                     if (newValue >= int.Parse(column.Lowest))
                     {
-                        column.Message = string.Format("No new numric code less than {0} available for column: {1}", column.Lowest, column.Name);
-                        _logManager.Add(new LogEntity() { Level = LogLevel.Warning, Section = _logSection, Message = column.Message });
+                        column.Message = $"No new numeric code less than {column.Lowest} available for column: {column.Name}";
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Warning,
+                            Section = _logSection,
+                            Message = column.Message
+                        });
                     }
                     else
                     {
-                        _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Map column {0} Missing Value {1} to {2}", column.Name, value.Key, newValue) });
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Mapped column {column.Name} Missing Value {value.Key} to {newValue}"
+                        });
                         column.MissingValues[value.Key] = newValue.ToString();
                         availableNumerics.Add(newValue.ToString());
                     }
                 });
-                if(string.IsNullOrEmpty(column.Message))
+
+                if (string.IsNullOrEmpty(column.Message))
                 {
                     column.SortedMissingValues = column.MissingValues.Values.ToList();
                     column.SortedMissingValues.Sort(new IntComparer());
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Successfully completed integer conversion for column {column.Name}"
+                    });
                 }
             }
         }
 
         private void ConvertMissingValuesToDecimals(Regex regex, Column column, int length, List<string> availableNumerics)
         {
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting decimal conversion for column {column.Name} with length {length}"
+            });
+
             if (length > 0)
             {
-                if (length > 9) { length = 9; }
+                if (length > 9)
+                {
+                    length = 9;
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Warning,
+                        Section = _logSection,
+                        Message = $"Length truncated to 9 for column {column.Name}"
+                    });
+                }
+
                 decimal newValue = ((decimal.Parse(Math.Pow(10, length).ToString()) - 1) * -1);
-                column.MissingValues.Where(v => regex.IsMatch(v.Key)).ToList().ForEach(value =>
+                var matchingValues = column.MissingValues.Where(v => regex.IsMatch(v.Key)).ToList();
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Found {matchingValues.Count} values to convert for column {column.Name}"
+                });
+
+                matchingValues.ForEach(value =>
                 {
                     while (decimal.Parse(column.Lowest) > newValue && availableNumerics.Contains(newValue.ToString()))
                     {
                         newValue++;
                     }
+
                     if (newValue >= decimal.Parse(column.Lowest))
                     {
-                        column.Message = string.Format("No new numric code less than {0} available for column: {1}", column.Lowest, column.Name);
-                        _logManager.Add(new LogEntity() { Level = LogLevel.Warning, Section = _logSection, Message = column.Message });
+                        column.Message = $"No new decimal code less than {column.Lowest} available for column: {column.Name}";
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Warning,
+                            Section = _logSection,
+                            Message = column.Message
+                        });
                     }
                     else
                     {
-                        _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Map column {0} Missing Value {1} to {2}", column.Name, value.Key, newValue) });
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Mapped column {column.Name} Missing Value {value.Key} to {newValue}"
+                        });
                         column.MissingValues[value.Key] = newValue.ToString();
                         availableNumerics.Add(newValue.ToString());
                     }
                 });
+
                 if (string.IsNullOrEmpty(column.Message))
                 {
                     column.SortedMissingValues = column.MissingValues.Values.ToList();
                     column.SortedMissingValues.Sort(new DecimalComparer());
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Successfully completed decimal conversion for column {column.Name}"
+                    });
                 }
             }
         }
 
         private void ConvertMissingValuesToNumbers(Regex regex, Column column)
         {
-            var availableNumerics = new List<string>();
-            column.MissingValues.Where(v => !regex.IsMatch(v.Key)).ToList().ForEach(value => {
-                if (!availableNumerics.Contains(value.Value)) { availableNumerics.Add(value.Value); }
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting numeric conversion for column {column.Name}"
             });
+
+            var availableNumerics = new List<string>();
+            var existingValues = column.MissingValues.Where(v => !regex.IsMatch(v.Key)).ToList();
+
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Debug,
+                Section = _logSection,
+                Message = $"Found {existingValues.Count} existing numeric values in column {column.Name}"
+            });
+
+            existingValues.ForEach(value => {
+                if (!availableNumerics.Contains(value.Value))
+                {
+                    availableNumerics.Add(value.Value);
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Debug,
+                        Section = _logSection,
+                        Message = $"Added {value.Value} to available numerics pool for column {column.Name}"
+                    });
+                }
+            });
+
             int length = -1;
             if (column.TypeOriginal == "INTEGER")
             {
                 length = GetIntegerLength(column);
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Converting to integers with length {length} for column {column.Name}"
+                });
                 ConvertMissingValuesToIntegers(regex, column, length, availableNumerics);
             }
             if (column.TypeOriginal == "DECIMAL")
             {
                 length = GetDecimalLength(column)[0];
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Converting to decimals with length {length} for column {column.Name}"
+                });
                 ConvertMissingValuesToDecimals(regex, column, length, availableNumerics);
-            }            
+            }
+
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Completed numeric conversion for column {column.Name}"
+            });
         }
 
-        private void ConvertMissingValuesToChars(Regex regex, Column column,string[] specialNumerics)
+        private void ConvertMissingValuesToChars(Regex regex, Column column, string[] specialNumerics)
         {
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting character conversion for column {column.Name}"
+            });
+
             var result = true;
             var availableNumerics = new List<string>();
             availableNumerics.AddRange(specialNumerics);
-            column.MissingValues.Where(v => regex.IsMatch(v.Value)).ToList().ForEach(value => {
-                if(availableNumerics.Contains(value.Value)) { availableNumerics.Remove(value.Value); }
+
+            var existingValues = column.MissingValues.Where(v => regex.IsMatch(v.Value)).ToList();
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Found {existingValues.Count} existing special numeric values"
             });
-            column.MissingValues.Where(v => !regex.IsMatch(v.Value)).ToList().ForEach(value =>
+
+            existingValues.ForEach(value => {
+                if (availableNumerics.Contains(value.Value))
+                {
+                    availableNumerics.Remove(value.Value);
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Debug,
+                        Section = _logSection,
+                        Message = $"Removed {value.Value} from available numerics pool"
+                    });
+                }
+            });
+
+            var valuesToConvert = column.MissingValues.Where(v => !regex.IsMatch(v.Value)).ToList();
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Found {valuesToConvert.Count} values to convert"
+            });
+
+            valuesToConvert.ForEach(value =>
             {
                 result = availableNumerics.Count > 0;
-                if(result)
+                if (result)
                 {
                     var newValue = availableNumerics[0];
-                    _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Map column {0} Missing Value {1} to {2}", column.Name, value.Key, newValue) });
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Mapped column {column.Name} Missing Value {value.Key} to {newValue}"
+                    });
                     column.MissingValues[value.Key] = newValue;
                     availableNumerics.Remove(newValue);
-                }                    
+                }
             });
+
             if (!result)
             {
-                _logManager.Add(new LogEntity() { Level = LogLevel.Warning, Section = _logSection, Message = string.Format("No new Special Numeric code available for column: {0}", column.Name) });
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Warning,
+                    Section = _logSection,
+                    Message = $"No new Special Numeric codes available for column: {column.Name}"
+                });
+            }
+            else
+            {
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Successfully completed character conversion for column {column.Name}"
+                });
             }
         }
 
         private bool EnsureMissingValues()
         {
-            var result = true;            
+            var result = true;
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting missing values processing for script type: {_report.ScriptType}"
+            });
+
             try
             {
                 Regex regex = null;
-                switch(_report.ScriptType)
+                switch (_report.ScriptType)
                 {
-                    case ScriptType.SPSS: regex = GetRegex(SpecialNumericPattern);break;
-                    case ScriptType.SAS: regex = GetRegex(SasSpecialNumericPattern); break;
-                    case ScriptType.Stata: regex = GetRegex(StataSpecialNumericPattern); break;
-                }                
+                    case ScriptType.SPSS:
+                        regex = GetRegex(SpecialNumericPattern);
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = "Using SPSS special numeric pattern"
+                        });
+                        break;
+                    case ScriptType.SAS:
+                        regex = GetRegex(SasSpecialNumericPattern);
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = "Using SAS special numeric pattern"
+                        });
+                        break;
+                    case ScriptType.Stata:
+                        regex = GetRegex(StataSpecialNumericPattern);
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = "Using Stata special numeric pattern"
+                        });
+                        break;
+                }
+
                 _report.Tables.ForEach(table =>
                 {
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Processing missing values for table: {table.Name}"
+                    });
+
                     if (_report.ScriptType == ScriptType.SPSS)
                     {
                         EnsureTableMissingValues(table, string.Format(TableXmlNs, table.SrcFolder));
                         EnsureCodeListMissingValues(table);
-                    }                   
-                    table.Columns.Where(c => c.MissingValues != null).ToList().ForEach(column =>
+                    }
+
+                    var columnsWithMissingValues = table.Columns.Where(c => c.MissingValues != null).ToList();
+                    _logManager.Add(new LogEntity()
                     {
-                        if (_report.ScriptType == ScriptType.SPSS) { ConvertMissingValuesToNumbers(regex, column); }
-                        if (_report.ScriptType == ScriptType.SAS) { ConvertMissingValuesToChars(regex, column,_sasSpecialNumerics.ToArray()); }
-                        if (_report.ScriptType == ScriptType.Stata) { ConvertMissingValuesToChars(regex, column, _stataSpecialNumerics.ToArray()); }
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Found {columnsWithMissingValues.Count} columns with missing values in table {table.Name}"
                     });
+
+                    columnsWithMissingValues.ForEach(column =>
+                    {
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Processing missing values for column {column.Name} in table {table.Name}"
+                        });
+
+                        if (_report.ScriptType == ScriptType.SPSS)
+                        {
+                            ConvertMissingValuesToNumbers(regex, column);
+                        }
+                        if (_report.ScriptType == ScriptType.SAS)
+                        {
+                            ConvertMissingValuesToChars(regex, column, _sasSpecialNumerics.ToArray());
+                        }
+                        if (_report.ScriptType == ScriptType.Stata)
+                        {
+                            ConvertMissingValuesToChars(regex, column, _stataSpecialNumerics.ToArray());
+                        }
+                    });
+                });
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = "Successfully completed missing values processing for all tables"
                 });
             }
             catch (Exception ex)
             {
                 result = false;
-                _log.Error("EnsureMissingValues Failed", ex);
-                _logManager.Add(new LogEntity() { Level = LogLevel.Error, Section = _logSection, Message = string.Format("EnsureMissingValues Failed: {0}", ex.Message) });
+                _log.Error("Missing values processing failed", ex);
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Missing values processing failed: {ex.Message}. Stack trace: {ex.StackTrace}"
+                });
             }
             return result;
         }
@@ -362,28 +772,85 @@ namespace Rigsarkiv.Styx
         private bool EnsureUserCodes()
         {
             var result = true;
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = "Starting user codes generation for all tables"
+            });
+
             try
             {
-                _report.Tables.ForEach(table =>
+                var tablesWithUserCodes = _report.Tables.Where(t => t.Columns.Any(c => c.MissingValues != null)).ToList();
+
+                _logManager.Add(new LogEntity()
                 {
-                    _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Write {0} user codes", table.Folder) });
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Found {tablesWithUserCodes.Count} tables requiring user codes"
+                });
+
+                tablesWithUserCodes.ForEach(table =>
+                {
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Generating user codes for table: {table.Name}"
+                    });
+
                     EnsureUserCode(table);
+
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Completed user codes generation for table: {table.Name}"
+                    });
+                });
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = "Successfully completed user codes generation for all tables"
                 });
             }
             catch (Exception ex)
             {
                 result = false;
                 _log.Error("EnsureUserCodes Failed", ex);
-                _logManager.Add(new LogEntity() { Level = LogLevel.Error, Section = _logSection, Message = string.Format("EnsureUserCodes Failed: {0}", ex.Message) });
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"User codes generation failed: {ex.Message}"
+                });
             }
             return result;
         }
 
         private void EnsureUserCode(Table table)
         {
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting user code generation for table {table.Name}"
+            });
+
             string content = null;
             var usercodes = new List<string>();
-            table.Columns.Where(c => c.MissingValues != null).ToList().ForEach(column =>
+            var columnsWithMissingValues = table.Columns.Where(c => c.MissingValues != null).ToList();
+
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Processing {columnsWithMissingValues.Count} columns with missing values"
+            });
+
+            columnsWithMissingValues.ForEach(column =>
             {
                 content = string.Empty;
                 if (column.SortedMissingValues != null)
@@ -391,94 +858,295 @@ namespace Rigsarkiv.Styx
                     if (column.SortedMissingValues.Count < 4)
                     {
                         content = string.Join(" ", column.SortedMissingValues.Select(v => string.Format("'{0}'", v)).ToArray());
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Debug,
+                            Section = _logSection,
+                            Message = $"Generated simple user codes for column {column.Name}: {content}"
+                        });
                     }
                     else
                     {
-                        _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Apply User codes range for column {0}", column.Name) });
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Applying user codes range for column {column.Name}"
+                        });
+
                         string lastValue = column.SortedMissingValues[0];
                         var lastIndex = 1;
                         column.SortedMissingValues.ForEach(v => {
-                            if ((column.TypeOriginal == "INTEGER" && int.Parse(v) == (int.Parse(lastValue) + 1)) || (column.TypeOriginal == "DECIMAL" && decimal.Parse(v) == (decimal.Parse(lastValue) + 1)))
+                            if ((column.TypeOriginal == "INTEGER" && int.Parse(v) == (int.Parse(lastValue) + 1)) ||
+                                (column.TypeOriginal == "DECIMAL" && decimal.Parse(v) == (decimal.Parse(lastValue) + 1)))
                             {
                                 lastValue = v;
                                 lastIndex++;
                             }
                         });
-                        if (column.SortedMissingValues.Count > (lastIndex + 1)) { column.Message = "out of range"; }
-                        content = string.Format(UserCodeRange, column.SortedMissingValues[0], lastValue, lastIndex < column.SortedMissingValues.Count ? string.Format(UserCodeExtra, column.SortedMissingValues[lastIndex]) : string.Empty);
+
+                        if (column.SortedMissingValues.Count > (lastIndex + 1))
+                        {
+                            column.Message = "out of range";
+                            _logManager.Add(new LogEntity()
+                            {
+                                Level = LogLevel.Warning,
+                                Section = _logSection,
+                                Message = $"Values out of range detected for column {column.Name}"
+                            });
+                        }
+
+                        content = string.Format(UserCodeRange,
+                            column.SortedMissingValues[0],
+                            lastValue,
+                            lastIndex < column.SortedMissingValues.Count ?
+                                string.Format(UserCodeExtra, column.SortedMissingValues[lastIndex]) :
+                                string.Empty);
+
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Debug,
+                            Section = _logSection,
+                            Message = $"Generated range-based user codes for column {column.Name}"
+                        });
                     }
-                }                
+                }
                 usercodes.Add(content);
             });
-            if(usercodes.Count == 0) { return; }
 
-            var path = string.Format(UserCodesPath, _destFolderPath, _report.ScriptType.ToString().ToLower(), NormalizeName(table.Name));
-            content = File.ReadAllText(path);
-            using (var sw = new StreamWriter(path, false, Encoding.UTF8))
+            if (usercodes.Count == 0)
             {
-                sw.Write(string.Format(content, usercodes.ToArray()));
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"No user codes to generate for table {table.Name}"
+                });
+                return;
+            }
+
+            try
+            {
+                var path = string.Format(UserCodesPath, _destFolderPath, _report.ScriptType.ToString().ToLower(), NormalizeName(table.Name));
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Writing user codes to file: {path}"
+                });
+
+                content = File.ReadAllText(path);
+                using (var sw = new StreamWriter(path, false, Encoding.UTF8))
+                {
+                    sw.Write(string.Format(content, usercodes.ToArray()));
+                }
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Successfully wrote user codes for table {table.Name}"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Failed to write user codes for table {table.Name}: {ex.Message}"
+                });
+                throw;
             }
         }
 
         private bool EnsureCodeLists()
         {
             var result = true;
+            _logManager.Add(new LogEntity()
+            {
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = "Starting code lists processing"
+            });
+
             try
             {
                 _report.Tables.ForEach(table =>
                 {
-                    _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Write {0} code lists", table.Folder) });
-                    _codeLists.Clear();
-                    if (table.Columns.Any(c => c.CodeList != null))
+                    _logManager.Add(new LogEntity()
                     {
-                        EnsureCodeList(table);                        
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Processing code lists for table: {table.Name}"
+                    });
+
+                    _codeLists.Clear();
+                    var columnsWithCodeList = table.Columns.Where(c => c.CodeList != null).ToList();
+
+                    if (columnsWithCodeList.Any())
+                    {
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"Found {columnsWithCodeList.Count} columns with code lists in table {table.Name}"
+                        });
+                        EnsureCodeList(table);
                     }
+                    else
+                    {
+                        _logManager.Add(new LogEntity()
+                        {
+                            Level = LogLevel.Info,
+                            Section = _logSection,
+                            Message = $"No code lists found for table {table.Name}"
+                        });
+                    }
+                });
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Successfully processed code lists for all tables. Total code lists processed: {_report.CodeListsCounter}"
                 });
             }
             catch (Exception ex)
             {
                 result = false;
-                _log.Error("EnsureCodeLists Failed", ex);
-                _logManager.Add(new LogEntity() { Level = LogLevel.Error, Section = _logSection, Message = string.Format("EnsureCodeLists Failed: {0}", ex.Message) });
+                _log.Error("Code lists processing failed", ex);
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Code lists processing failed: {ex.Message}. Stack trace: {ex.StackTrace}"
+                });
             }
             return result;
         }
 
         private void EnsureCodeList(Table table)
         {
-            string path = null;            
-            var codeList = new StringBuilder();
-            table.Columns.Where(c => c.CodeList != null).ToList().ForEach(column =>
+            _logManager.Add(new LogEntity()
             {
-                column.CodeList.RowsCounter = 0;
-                _logManager.Add(new LogEntity() { Level = LogLevel.Info, Section = _logSection, Message = string.Format("Add {0} code list", column.CodeList.Name) });
-                XNamespace tableNS = string.Format(TableXmlNs, column.CodeList.SrcFolder);
-                path = string.Format(TablePath, _srcPath, column.CodeList.SrcFolder);
-                var columnKeyId = column.CodeList.Columns.Where(c => c.IsKey).Select(c => c.Id).FirstOrDefault();
-                var columnId = column.CodeList.Columns.Where(c => !c.IsKey).Select(c => c.Id).FirstOrDefault();
-                StreamElement(delegate (XElement row) {
-                    var code = row.Element(tableNS + columnKeyId).Value;
-                    if (column.MissingValues != null && column.MissingValues.ContainsKey(code))
-                    {
-                        code = column.MissingValues[code];
-                    }
-                    var codeDescription = row.Element(tableNS + columnId).Value;
-                    codeList.AppendLine(string.Format(CodeFormat, code, EnsureNewLines(codeDescription)));
-                    CheckCodeListDescriptionLength(column, codeDescription, code);
-                    column.CodeList.RowsCounter++;
-                }, path);
-                var codeListContent = codeList.ToString();                
-                _codeLists.Add(codeListContent.Substring(0, codeListContent.Length - 2));
-                codeList.Clear();
-                _report.CodeListsCounter++;
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Starting code list generation for table {table.Name}"
             });
-            path = string.Format(CodeListPath, _destFolderPath, _report.ScriptType.ToString().ToLower(), NormalizeName(table.Name));
-            var content = File.ReadAllText(path);
-            using (var sw = new StreamWriter(path, false, Encoding.UTF8))
+
+            string path = null;
+            var codeList = new StringBuilder();
+            var columnsWithCodeList = table.Columns.Where(c => c.CodeList != null).ToList();
+
+            _logManager.Add(new LogEntity()
             {
-                sw.Write(string.Format(content, _codeLists.ToArray()));
-            }            
+                Level = LogLevel.Info,
+                Section = _logSection,
+                Message = $"Found {columnsWithCodeList.Count} columns with code lists in table {table.Name}"
+            });
+
+            try
+            {
+                columnsWithCodeList.ForEach(column =>
+                {
+                    column.CodeList.RowsCounter = 0;
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Processing code list for column: {column.Name} ({column.CodeList.Name})"
+                    });
+
+                    XNamespace tableNS = string.Format(TableXmlNs, column.CodeList.SrcFolder);
+                    path = string.Format(TablePath, _srcPath, column.CodeList.SrcFolder);
+                    var columnKeyId = column.CodeList.Columns.Where(c => c.IsKey).Select(c => c.Id).FirstOrDefault();
+                    var columnId = column.CodeList.Columns.Where(c => !c.IsKey).Select(c => c.Id).FirstOrDefault();
+
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Debug,
+                        Section = _logSection,
+                        Message = $"Reading code list from path: {path}"
+                    });
+
+                    StreamElement(delegate (XElement row) {
+                        var code = row.Element(tableNS + columnKeyId).Value;
+                        if (column.MissingValues != null && column.MissingValues.ContainsKey(code))
+                        {
+                            code = column.MissingValues[code];
+                            _logManager.Add(new LogEntity()
+                            {
+                                Level = LogLevel.Debug,
+                                Section = _logSection,
+                                Message = $"Mapped missing value code: {code} in column {column.Name}"
+                            });
+                        }
+
+                        var codeDescription = row.Element(tableNS + columnId).Value;
+                        codeList.AppendLine(string.Format(CodeFormat, code, EnsureNewLines(codeDescription)));
+                        CheckCodeListDescriptionLength(column, codeDescription, code);
+                        column.CodeList.RowsCounter++;
+
+                        if (column.CodeList.RowsCounter % 1000 == 0)
+                        {
+                            _logManager.Add(new LogEntity()
+                            {
+                                Level = LogLevel.Info,
+                                Section = _logSection,
+                                Message = $"Processed {column.CodeList.RowsCounter} codes for {column.CodeList.Name}"
+                            });
+                        }
+                    }, path);
+
+                    var codeListContent = codeList.ToString();
+                    _codeLists.Add(codeListContent.Substring(0, codeListContent.Length - 2));
+                    codeList.Clear();
+                    _report.CodeListsCounter++;
+
+                    _logManager.Add(new LogEntity()
+                    {
+                        Level = LogLevel.Info,
+                        Section = _logSection,
+                        Message = $"Completed processing code list for {column.Name}. Total codes: {column.CodeList.RowsCounter}"
+                    });
+                });
+
+                // Skriv code lists til fil
+                path = string.Format(CodeListPath, _destFolderPath, _report.ScriptType.ToString().ToLower(), NormalizeName(table.Name));
+                var content = File.ReadAllText(path);
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Writing code lists to file: {path}"
+                });
+
+                using (var sw = new StreamWriter(path, false, Encoding.UTF8))
+                {
+                    sw.Write(string.Format(content, _codeLists.ToArray()));
+                }
+
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Info,
+                    Section = _logSection,
+                    Message = $"Successfully wrote all code lists for table {table.Name}"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logManager.Add(new LogEntity()
+                {
+                    Level = LogLevel.Error,
+                    Section = _logSection,
+                    Message = $"Failed processing code list at path {path}: {ex.Message}"
+                });
+                throw;
+            }
         }
+
 
         private void CheckCodeListDescriptionLength(Column column, string codeDescription, string code)
         {
@@ -486,7 +1154,7 @@ namespace Rigsarkiv.Styx
             if (codeDescriptionLength > CodeDescriptionMaxLength)
             {
                 _logManager.Add(new LogEntity() { Level = LogLevel.Warning, Section = _logSection, Message = $"Value label: {column.Name} ('{code}') has been truncated" });
-                column.CodeDescriptionLengthExceededList.Add(new CodeDescriptionLengthExceeded {ByteLength = codeDescriptionLength, Code = code});
+                column.CodeDescriptionLengthExceededList.Add(new CodeDescriptionLengthExceeded { ByteLength = codeDescriptionLength, Code = code });
             }
         }
 
